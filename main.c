@@ -28,7 +28,7 @@ int main(int argc, char *argv[]){
         // cos innego niz 0 to blad
         return 1;
     }
-    fprintf(stdout, "Tryb pracy: %d\n", tryb_pracy);
+    //fprintf(stdout, "Tryb pracy: %d\n", tryb_pracy);
 
 
     // 2. Wypisanie PID P0 - macierzystego
@@ -36,8 +36,8 @@ int main(int argc, char *argv[]){
 
     // 3. Utworzenie P1, P2, P3
     P1 = utworz_proces(proces_1, "P1");
-    P2 = utworz_proces(proces_2, "P2");
-    P3 = utworz_proces(proces_3, "P3");
+    //P2 = utworz_proces(proces_2, "P2");
+    //P3 = utworz_proces(proces_3, "P3");
 
     printf("[MAIN] Procesy potomne utworzone: P1=%d, P2=%d, P3=%d\n", P1, P2, P3);
 
@@ -99,9 +99,53 @@ int konfiguracja_trybow(int argc, char *argv[]){
 
 void proces_1() {
     // Tutaj będzie: Czytanie z pliku/klawiatury -> Konwersja HEX -> Zapis do Shared Memory
-    printf(" -> [P1] Uruchomiony. Konwersja HEX i Shared Memory.\n");
-    sleep(2); // Symulacja pracy
-    printf(" -> [P1] Koniec.\n");
+    FILE *wejscie = NULL;
+    size_t odczytane_bajty; //typ liczbowy bez znaku
+    unsigned char bufor[1024];
+    int limit_urandom = 0; //Zabezpiecznie przy czytaniu urandom
+
+
+    if(tryb_pracy==1){ //Klawiatura
+        wejscie = stdin;
+        printf(" -> [P1] Tryb Interaktywny. Wpisz tekst i zatwierdź ENTER(CTRL+D zakonczy)\n");    
+    }
+    else if(tryb_pracy==2){ //Plik
+        wejscie = fopen(sciezka_do_pliku, "r");
+        if(wejscie == NULL){
+            perror(" -> [P1] Błąd otwarcia pliku wejściowego");
+            exit(1);
+        }
+        printf(" -> [P1] Otwarto plik: %s\n", sciezka_do_pliku);
+    }
+    else if(tryb_pracy==3){
+        wejscie = fopen("/dev/urandom", "r");
+        if(wejscie == NULL){
+            perror(" -> [P1] Błąd otwierania/dev/urandom");
+            exit(1);
+        }
+        printf(" -> [P1] Otwarto plik dev/urandom\n");   
+    }
+
+    printf(" -> [P1] Zaczynam czytać dane...\n");
+
+    // fread - wczytuje określoną ilość danych ze strumienia
+    while ((odczytane_bajty = fread(bufor, 1, sizeof(bufor), wejscie)) > 0){
+        printf(" -> [P1] Pobrano paczkę danych: %lu bajtów.\n", odczytane_bajty);
+
+        if(tryb_pracy==3){
+            limit_urandom++;
+            if(limit_urandom >= 5){
+                printf(" -> [P1] Limit testowy urandom osiągnięty.\n");
+                break;
+            }
+            sleep(1);
+        }
+    }
+
+    if(tryb_pracy != 1 && wejscie != NULL){
+        fclose(wejscie);
+    }
+    printf(" -> [P1] Zakończono pobieranie danych.\n");
 }
 
 void proces_2() {

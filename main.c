@@ -4,6 +4,7 @@
 #include <sys/types.h> //obsługa nazw zmiennych 
 #include <sys/wait.h>
 #include <signal.h>
+#include <string.h>
 
 // ------- ZMIENNE GLOBALNE ------
 pid_t P1 = 0;
@@ -27,6 +28,8 @@ int main(int argc, char *argv[]){
         // cos innego niz 0 to blad
         return 1;
     }
+    fprintf(stdout, "Tryb pracy: %d\n", tryb_pracy);
+
 
     // 2. Wypisanie PID P0 - macierzystego
     printf("P0 - PID: %d\n", getpid());
@@ -70,6 +73,27 @@ int konfiguracja_trybow(int argc, char *argv[]){
         fprintf(stderr, "\t-r           : Odczyt z /dev/urandom\n");
         return -1;
     }
+
+    if (strcmp(argv[1], "-i") == 0){
+        tryb_pracy = 1; //Z klawiatury
+    }
+    else if(strcmp(argv[1], "-f") == 0){
+        if (argc < 3){
+            fprintf(stderr, "Nie podano nazwy pliku\n");
+            return -1;
+        }
+        tryb_pracy = 2; // z pliku
+        sciezka_do_pliku = argv[2];
+    }
+    else if(strcmp(argv[1], "-r") == 0){
+        tryb_pracy = 3; // /dev/urandom
+    }
+    else{
+        fprintf(stderr, "Nieznany tryb: %s\n", argv[1]);
+        return -1; //Blad
+    }
+
+    return 0; //zakonczono poprawnie
 
 }
 

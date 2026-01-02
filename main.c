@@ -29,9 +29,15 @@ pid_t P1 = 0;
 pid_t P2 = 0;
 pid_t P3 = 0;
 
-// ------ Zmienne dla trybu pracy dla procesu P1 ------
+// ------ Zmienne dla procesów ------
+// Dla P1:
 int tryb_pracy = 0;
 char *sciezka_do_pliku = NULL;
+
+//Dla komunikacji PIPE:
+int potok[2]; 
+// potok[0] -> wyjscie (czytanie)
+// potok[1] -> wejście (pisanie)
 
 #pragma endregion
 
@@ -80,13 +86,28 @@ int main(int argc, char *argv[]){
 
     #pragma endregion
 
+    #pragma region TWORZENIE POTOKU PIPE
+    if (pipe(potok) == -1){
+        perror("[MAIN] Błąd tworzenia potoku");
+        return 1;
+    }
+    printf("[MAIN] Potok utworzony.\n");
+
+    #pragma endregion
+
     #pragma region TWORZENIE PROCESOW P1,P2,P3
     P1 = utworz_proces(proces_1, "P1");
     P2 = utworz_proces(proces_2, "P2");
-    //P3 = utworz_proces(proces_3, "P3");
+    P3 = utworz_proces(proces_3, "P3");
 
     printf("[MAIN] Procesy potomne utworzone: P1=%d, P2=%d, P3=%d\n", P1, P2, P3);
 
+    #pragma endregion
+
+    #pragma region ZAMYKANIE KONCOWEK w PIPE
+    // P0 nie korzysta z potoku, więc musi zamknąć obie końcówki w przeciwnym razie P3 nigdy nie dostanie sygnały EOF
+    close(potok[0]);
+    close(potok[1]);
     #pragma endregion
 
     #pragma region SPRZATANIE SYSTEMU
@@ -200,9 +221,11 @@ void proces_1() {
 
 //Odczyt z Shared Memory -> Zapis do PIPE
 void proces_2() {
+    close(potok[0]); //zamknięcie koncowki do czytania
+
     printf(" -> [P2] Uruchomiony. Czekam na dane w Shared Memory...\n");    
 
-    #pragma region ODCZYT Z SHARED_MEMORY
+    #pragma region ODCZYT Z SHARED_MEMORY i zapis do PIPE
     while(1){
         // Czekamy na dane od P1 (status=1)
         while(dzielona_pamiec->status == 0){
@@ -211,11 +234,23 @@ void proces_2() {
         }
 
         if(dzielona_pamiec->czy_koniec == 1){
-            printf(" -> [P2] Odebrano sygnał końca pracy.\n");
+            printf(" -> [P2] Odebrano sygnał końca pracy. Zamykam potok\n");
             break;
         }
 
-        printf(" -> [P2] POBRANO z SHM: %s\n", dzielona_pamiec->dane);
+        //printf(" -> [P2] POBRANO z SHM: %s\n", dzielona_pamiec->dane);
+
+        #pragma region ZAPIS DO PIPE
+        int len = strlen(dzielona_pamiec->dane);
+        if (len>0){
+            // write(deskryptor, bufor, ilosc_bajtow)
+            if (write(potok[1], dzielona_pamiec->dane, len) == -1){
+                perror(" -> [P2] Błąd zapisu do potoku");
+                break;
+            }
+            printf(" -> [P2] Przekazano do PIPE %d bajtów.\n", len);
+        }
+        #pragma endregion
 
         //czyszczenie bufora dla bezpieczenstwa
         memset(dzielona_pamiec->dane, 0, SHARED_SIZE); //wypełnia pamięć bajtem
@@ -225,13 +260,26 @@ void proces_2() {
     }
     #pragma endregion
 
+    close(potok[1]); // zamknięcie potoku do wpisywania
     printf(" -> [P2] Koniec.\n");
 }
 
+//Odczyt z PIPE -> Wypisanie na ekran
 void proces_3() {
-    // Tutaj będzie: Odczyt z PIPE -> Wypisanie na ekran
+    close(potok[1]); //zamknięcie koncowki do pisania
+
     printf(" -> [P3] Uruchomiony. Odczyt z Pipe i ekran.\n");
-    sleep(2);
+    
+    char bufor_pipe[SHARED_SIZE];
+    ssize_t bajty;
+
+    // read() blokuje proces dopóki nie pojawią się dane w potoku. Zwraca EOF, gdy P2 zamnie swoją końcówkę do wpisywania potok[1]
+    while ((bajty = read(potok[0], bufor_pipe, sizeof(bufor_pipe)-1)) > 0){
+        bufor_pipe[bajty] = '\0'; //dodajemy znak EOF, bo read tego nie robi
+        printf("\n*** [P3] OTRZYMANO DANE HEX: ***\n%s\n********************************\n", bufor_pipe);
+    }
+
+    close(potok[0]); //zamknięcie czytania
     printf(" -> [P3] Koniec.\n");
 }
 

@@ -97,12 +97,26 @@ int konfiguracja_trybow(int argc, char *argv[]){
 
 }
 
+void to_hex(const char *ascii, size_t len, char *hex){
+    const char hex_map[] = "0123456789ABCDEF";
+    
+    for (size_t i=0; i<len; i++){
+        unsigned char bajt = (unsigned char)ascii[i];
+        // Pierwszy znak HEX - 4bity
+        hex[i*2] = hex_map[bajt >> 4];
+        // Nastepne 4 bity
+        hex[i*2 + 1] = hex_map[bajt & 0x0F];
+    }
+    hex[len*2] = '\0'; //End of line
+}
+
 void proces_1() {
     // Tutaj będzie: Czytanie z pliku/klawiatury -> Konwersja HEX -> Zapis do Shared Memory
     FILE *wejscie = NULL;
     size_t odczytane_bajty; //typ liczbowy bez znaku
     unsigned char bufor[1024];
     int limit_urandom = 0; //Zabezpiecznie przy czytaniu urandom
+    char hex_bufor[(sizeof(bufor) * 2) + 1]; //każdy bajt to 2 znaki HEX + 1 bajt na znak konca napisu \0
 
 
     if(tryb_pracy==1){ //Klawiatura
@@ -131,6 +145,20 @@ void proces_1() {
     // fread - wczytuje określoną ilość danych ze strumienia
     while ((odczytane_bajty = fread(bufor, 1, sizeof(bufor), wejscie)) > 0){
         printf(" -> [P1] Pobrano paczkę danych: %lu bajtów.\n", odczytane_bajty);
+
+        // !!! - należ uważać, że w odcztane_bajty wlicza się znak nowej linii (0x0A), dlatego należy to usunąć w funkcji
+        if (tryb_pracy != 3 && odczytane_bajty > 0 && bufor[odczytane_bajty-1] == '\n'){
+            odczytane_bajty--; //bo znak nowej linii jest ostatnim bajtem
+        }
+
+        //jesli po usunieciu entera nic nie zostalo (np. wcisnieto sam ENTER) pomijamy pętlę
+        if(odczytane_bajty == 0){
+            continue;
+        }
+
+        to_hex((char*)bufor, odczytane_bajty, hex_bufor);
+
+        printf(" -> [P1] Wynik HEX: %s\n", hex_bufor);
 
         if(tryb_pracy==3){
             limit_urandom++;

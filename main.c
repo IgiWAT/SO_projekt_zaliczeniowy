@@ -5,8 +5,26 @@
 #include <sys/wait.h>
 #include <signal.h>
 #include <string.h>
+#include <sys/ipc.h> //shared_memory
+#include <sys/shm.h> //shared_memory
 
-// ------- ZMIENNE GLOBALNE ------
+#pragma region ZMIENNE GLOBALNE dla SHARED_MEMORY
+
+#define SHARED_SIZE 4096 //rozmiar pamięci współdzielonej(musi pomieścić dane hex)
+
+//struktura, która będzie się znajdować w pamięci wspólnej
+typedef struct{
+    volatile int status;     // 0=Puste (P1 moze pisac), 1=Pelne (P2 moze czytac)
+    volatile int czy_koniec; // 0=dzialanie, 1=koniec
+    char dane[SHARED_SIZE];  //bufor na dane HEX
+} DaneWspolne;
+
+// Globalny wskaznik, żeby procesy go widziały
+DaneWspolne *dzielona_pamiec = NULL;
+int shm_id = 0;
+#pragma endregion
+
+#pragma region ZMIENNE GLOBALNE
 pid_t P1 = 0;
 pid_t P2 = 0;
 pid_t P3 = 0;
@@ -15,39 +33,207 @@ pid_t P3 = 0;
 int tryb_pracy = 0;
 char *sciezka_do_pliku = NULL;
 
-// ------ DEKALARACJA FUNKCJI ------
+#pragma endregion
+
+#pragma region DEKALARACJE FUNKCJI
+
 pid_t utworz_proces(void (*funkcja_procesu)(), const char* nazwa);
 int konfiguracja_trybow(int argc, char *argv[]);
+void to_hex(const char *ascii, size_t len, char *hex);
 void proces_1();
 void proces_2();
 void proces_3();
+
+#pragma endregion
 
 int main(int argc, char *argv[]){
     // Obsluga arguemntow przekazywanych do programu
     if (konfiguracja_trybow(argc, argv) != 0){
         // cos innego niz 0 to blad
         return 1;
+        //fprintf(stdout, "Tryb pracy: %d\n", tryb_pracy);
     }
-    //fprintf(stdout, "Tryb pracy: %d\n", tryb_pracy);
 
+    printf("P0 - PID: %d\n", getpid()); //P0 - proces macierzysty
 
-    // 2. Wypisanie PID P0 - macierzystego
-    printf("P0 - PID: %d\n", getpid());
+    #pragma region TWORZENIE PAMIECI WSPOLDZIELONEJ
 
-    // 3. Utworzenie P1, P2, P3
+    shm_id = shmget(IPC_PRIVATE, sizeof(DaneWspolne), 0666 | IPC_CREAT); //IPC_PRIVATE - server(P0)-client(P1/P2)
+    if(shm_id < 0){
+        perror("Blad shmget");
+        return 1;
+    }
+
+    //Podlaczenie pamieci do procesu P0
+    dzielona_pamiec = (DaneWspolne*)shmat(shm_id, NULL, 0);
+    if (dzielona_pamiec == (DaneWspolne*)-1){
+        perror("Blad shmat");
+        return 1;
+    }
+
+    //inicjalizacja pamieci
+    dzielona_pamiec->status = 0; //gotowy na zapis
+    dzielona_pamiec->czy_koniec = 0; //nieskonczone
+    memset(dzielona_pamiec->dane, 0, SHARED_SIZE);
+
+    printf("[MAIN] Pamięć współdzielona utworzona (ID: %d)\n", shm_id);
+
+    #pragma endregion
+
+    #pragma region TWORZENIE PROCESOW P1,P2,P3
     P1 = utworz_proces(proces_1, "P1");
-    //P2 = utworz_proces(proces_2, "P2");
+    P2 = utworz_proces(proces_2, "P2");
     //P3 = utworz_proces(proces_3, "P3");
 
     printf("[MAIN] Procesy potomne utworzone: P1=%d, P2=%d, P3=%d\n", P1, P2, P3);
 
-    // 3. Oczekiwanie na zakończenie (sprzątanie) - czekamy na dowolne dziecko, dopóki są jakieś dzieci
+    #pragma endregion
+
+    #pragma region SPRZATANIE SYSTEMU
+    // Oczekiwanie na zakończenie (sprzątanie) - czekamy na dowolne dziecko, dopóki są jakieś dzieci
     while (wait(NULL) > 0); //Wstymanie pracy P0
 
     printf("[MAIN] Wszystkie procesy zakończone. Koniec.\n");
+
+    //Sprzatanie po shared_memory
+    shmdt(dzielona_pamiec);         // Odlaczenie pamieci od P0
+    shmctl(shm_id, IPC_RMID, NULL); // Oznaczamy do usuniecia z systemu
+    
+    #pragma endregion
+
     return 0;
 }
 
+
+//Czytanie z pliku/klawiatury/urandom -> Konwersja HEX -> Zapis do Shared Memory
+void proces_1() {
+    #pragma region ZMIENNE
+    FILE *wejscie = NULL;
+    size_t odczytane_bajty; //typ liczbowy bez znaku
+    unsigned char bufor[1024];
+    int limit_urandom = 0; //Zabezpiecznie przy czytaniu urandom
+    char hex_bufor[(sizeof(bufor) * 2) + 1]; //każdy bajt to 2 znaki HEX + 1 bajt na znak konca napisu \0
+    #pragma endregion
+
+    #pragma region WYBOR TRYBU PRACY
+    if(tryb_pracy==1){ //Klawiatura
+        wejscie = stdin;
+        printf(" -> [P1] Tryb Interaktywny. Wpisz tekst i zatwierdź ENTER(CTRL+D zakonczy)\n");    
+    }
+    else if(tryb_pracy==2){ //Plik
+        wejscie = fopen(sciezka_do_pliku, "r");
+        if(wejscie == NULL){
+            perror(" -> [P1] Błąd otwarcia pliku wejściowego");
+            exit(1);
+        }
+        printf(" -> [P1] Otwarto plik: %s\n", sciezka_do_pliku);
+    }
+    else if(tryb_pracy==3){
+        wejscie = fopen("/dev/urandom", "r");
+        if(wejscie == NULL){
+            perror(" -> [P1] Błąd otwierania/dev/urandom");
+            exit(1);
+        }
+        printf(" -> [P1] Otwarto plik dev/urandom\n");   
+    }
+    #pragma endregion
+
+    printf(" -> [P1] Zaczynam czytać dane...\n");
+
+    // fread - wczytuje określoną ilość danych ze strumienia
+    while ((odczytane_bajty = fread(bufor, 1, sizeof(bufor), wejscie)) > 0){
+        #pragma region POBRANIE DANYCH -> ZAMIANA NA HEX
+        printf(" -> [P1] Pobrano paczkę danych: %lu bajtów.\n", odczytane_bajty);
+
+        // !!! - należ uważać, że w odcztane_bajty wlicza się znak nowej linii (0x0A), dlatego należy to usunąć w funkcji
+        if (tryb_pracy != 3 && odczytane_bajty > 0 && bufor[odczytane_bajty-1] == '\n'){
+            odczytane_bajty--; //bo znak nowej linii jest ostatnim bajtem
+        }
+
+        //jesli po usunieciu entera nic nie zostalo (np. wcisnieto sam ENTER) pomijamy pętlę
+        if(odczytane_bajty == 0){
+            continue;
+        }
+
+        to_hex((char*)bufor, odczytane_bajty, hex_bufor);
+
+        printf(" -> [P1] Wynik HEX: %s\n", hex_bufor);
+        #pragma endregion
+
+        if(tryb_pracy==3){ 
+            limit_urandom++;
+            if(limit_urandom >= 5){
+                printf(" -> [P1] Limit testowy urandom osiągnięty.\n");
+                break;
+            }
+            sleep(1);
+        }
+
+        #pragma region ZAPIS do SHARED MEMORY
+
+        // Czekamy aż P2 odbierze dane (status=0)
+        while(dzielona_pamiec->status == 1){
+            usleep(1000); //1ms
+        }
+
+        // Kopiujemy dane do pamięci współdzielonej
+        strncpy(dzielona_pamiec->dane, hex_bufor, SHARED_SIZE-1); //kopiuje dane aż nie napotka znaku konca linii \0 strncpy(cel, zrodlo, max_znakow)
+        dzielona_pamiec->dane[SHARED_SIZE-1]='\0';
+
+        //informujemy P2, że dane są gotowe
+        dzielona_pamiec->status = 1;
+        #pragma endregion
+    }
+
+    #pragma region KONIEC ZAPISYWANIA DO SHARED_MEMORY
+    //czekamy aż P2 odbierze ostanią daną
+    while(dzielona_pamiec->status == 1) usleep(1000);
+
+    dzielona_pamiec->czy_koniec=1; //flaga konca
+    dzielona_pamiec->status=1;
+
+    #pragma endregion
+
+    if(tryb_pracy != 1 && wejscie != NULL) fclose(wejscie);
+    printf(" -> [P1] Zakończono pobieranie danych.\n");
+}
+
+//Odczyt z Shared Memory -> Zapis do PIPE
+void proces_2() {
+    printf(" -> [P2] Uruchomiony. Czekam na dane w Shared Memory...\n");    
+
+    #pragma region ODCZYT Z SHARED_MEMORY
+    while(1){
+        // Czekamy na dane od P1 (status=1)
+        while(dzielona_pamiec->status == 0){
+            // Jeśli P1 jeszcze nic nie dał, sprawdzamy czy może już skończył? Ale P1 ustawia status=1 również przy wysyłaniu sygnału końca, więc główne sprawdzenie końca jest poniżej.
+            usleep(1000);
+        }
+
+        if(dzielona_pamiec->czy_koniec == 1){
+            printf(" -> [P2] Odebrano sygnał końca pracy.\n");
+            break;
+        }
+
+        printf(" -> [P2] POBRANO z SHM: %s\n", dzielona_pamiec->dane);
+
+        //czyszczenie bufora dla bezpieczenstwa
+        memset(dzielona_pamiec->dane, 0, SHARED_SIZE); //wypełnia pamięć bajtem
+
+        // Informujemy P1, że odebraliśmy dane
+        dzielona_pamiec->status = 0;
+    }
+    #pragma endregion
+
+    printf(" -> [P2] Koniec.\n");
+}
+
+void proces_3() {
+    // Tutaj będzie: Odczyt z PIPE -> Wypisanie na ekran
+    printf(" -> [P3] Uruchomiony. Odczyt z Pipe i ekran.\n");
+    sleep(2);
+    printf(" -> [P3] Koniec.\n");
+}
 
 pid_t utworz_proces(void (*funkcja_procesu)(), const char* nazwa){
     pid_t pid = fork();
@@ -69,7 +255,7 @@ int konfiguracja_trybow(int argc, char *argv[]){
         fprintf(stderr, "Uzycie: %s <tryb>\n", argv[0]);
         fprintf(stderr, "Tryby:\n");
         fprintf(stderr, "\t-i           : Tryb interaktywny (klawiatura)\n");
-        fprintf(stderr, "\t-p <plik>    : Odczyt z pliku tekstowego\n");
+        fprintf(stderr, "\t-f <plik>    : Odczyt z pliku tekstowego\n");
         fprintf(stderr, "\t-r           : Odczyt z /dev/urandom\n");
         return -1;
     }
@@ -108,84 +294,4 @@ void to_hex(const char *ascii, size_t len, char *hex){
         hex[i*2 + 1] = hex_map[bajt & 0x0F];
     }
     hex[len*2] = '\0'; //End of line
-}
-
-void proces_1() {
-    // Tutaj będzie: Czytanie z pliku/klawiatury -> Konwersja HEX -> Zapis do Shared Memory
-    FILE *wejscie = NULL;
-    size_t odczytane_bajty; //typ liczbowy bez znaku
-    unsigned char bufor[1024];
-    int limit_urandom = 0; //Zabezpiecznie przy czytaniu urandom
-    char hex_bufor[(sizeof(bufor) * 2) + 1]; //każdy bajt to 2 znaki HEX + 1 bajt na znak konca napisu \0
-
-
-    if(tryb_pracy==1){ //Klawiatura
-        wejscie = stdin;
-        printf(" -> [P1] Tryb Interaktywny. Wpisz tekst i zatwierdź ENTER(CTRL+D zakonczy)\n");    
-    }
-    else if(tryb_pracy==2){ //Plik
-        wejscie = fopen(sciezka_do_pliku, "r");
-        if(wejscie == NULL){
-            perror(" -> [P1] Błąd otwarcia pliku wejściowego");
-            exit(1);
-        }
-        printf(" -> [P1] Otwarto plik: %s\n", sciezka_do_pliku);
-    }
-    else if(tryb_pracy==3){
-        wejscie = fopen("/dev/urandom", "r");
-        if(wejscie == NULL){
-            perror(" -> [P1] Błąd otwierania/dev/urandom");
-            exit(1);
-        }
-        printf(" -> [P1] Otwarto plik dev/urandom\n");   
-    }
-
-    printf(" -> [P1] Zaczynam czytać dane...\n");
-
-    // fread - wczytuje określoną ilość danych ze strumienia
-    while ((odczytane_bajty = fread(bufor, 1, sizeof(bufor), wejscie)) > 0){
-        printf(" -> [P1] Pobrano paczkę danych: %lu bajtów.\n", odczytane_bajty);
-
-        // !!! - należ uważać, że w odcztane_bajty wlicza się znak nowej linii (0x0A), dlatego należy to usunąć w funkcji
-        if (tryb_pracy != 3 && odczytane_bajty > 0 && bufor[odczytane_bajty-1] == '\n'){
-            odczytane_bajty--; //bo znak nowej linii jest ostatnim bajtem
-        }
-
-        //jesli po usunieciu entera nic nie zostalo (np. wcisnieto sam ENTER) pomijamy pętlę
-        if(odczytane_bajty == 0){
-            continue;
-        }
-
-        to_hex((char*)bufor, odczytane_bajty, hex_bufor);
-
-        printf(" -> [P1] Wynik HEX: %s\n", hex_bufor);
-
-        if(tryb_pracy==3){
-            limit_urandom++;
-            if(limit_urandom >= 5){
-                printf(" -> [P1] Limit testowy urandom osiągnięty.\n");
-                break;
-            }
-            sleep(1);
-        }
-    }
-
-    if(tryb_pracy != 1 && wejscie != NULL){
-        fclose(wejscie);
-    }
-    printf(" -> [P1] Zakończono pobieranie danych.\n");
-}
-
-void proces_2() {
-    // Tutaj będzie: Odczyt z Shared Memory -> Zapis do PIPE
-    printf(" -> [P2] Uruchomiony. Most między Shared Memory a Pipe.\n");
-    sleep(2);
-    printf(" -> [P2] Koniec.\n");
-}
-
-void proces_3() {
-    // Tutaj będzie: Odczyt z PIPE -> Wypisanie na ekran
-    printf(" -> [P3] Uruchomiony. Odczyt z Pipe i ekran.\n");
-    sleep(2);
-    printf(" -> [P3] Koniec.\n");
 }

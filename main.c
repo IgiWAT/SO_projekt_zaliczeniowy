@@ -129,7 +129,7 @@ int main(int argc, char *argv[]){
 
     #pragma region SPRZATANIE SYSTEMU
     // Oczekiwanie na zakończenie (sprzątanie) - czekamy na dowolne dziecko, dopóki są jakieś dzieci
-    while (wait(NULL) > 0); //Wstymanie pracy P0
+    while (wait(NULL) > 0); //Wstymanie pracy P0 - pętla kończy się po wciśnięciu CTRL+D, które dla funkcji read(w P1) zwraca 0(EOF w UNIX), czyli kończy czytanie
 
     printf("[MAIN] Wszystkie procesy zakończone. Koniec.\n");
 
@@ -160,7 +160,7 @@ void proces_1() {
 
     #pragma region ZMIENNE
     FILE *wejscie = NULL;
-    size_t odczytane_bajty;
+    ssize_t odczytane_bajty;
     //unsigned char bufor[1024];
     unsigned char bufor[20]; //na potrzeby testowania pliku i urandom
     int limit_urandom = 0;
@@ -194,7 +194,8 @@ void proces_1() {
     printf(" -> [P1] Zaczynam czytać dane...\n");
 
     // Główna pętla przetwarzania
-    while (czy_dzialac && (odczytane_bajty = fread(bufor, 1, sizeof(bufor), wejscie)) > 0){
+    // fileno(wejscie) zamienia FILE* na int(deksryptor)
+    while (czy_dzialac && (odczytane_bajty = read(fileno(wejscie), bufor, sizeof(bufor))) > 0){
         
         // --- 1. OBSŁUGA PAUZY (Sygnał S2/S3) ---
         while(czy_wstrzymany && czy_dzialac){ 

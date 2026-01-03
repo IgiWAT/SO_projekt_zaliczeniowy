@@ -16,6 +16,13 @@
 typedef struct{
     volatile int status;     // 0=Puste (P1 moze pisac), 1=Pelne (P2 moze czytac)
     volatile int czy_koniec; // 0=dzialanie, 1=koniec
+
+    // ---------------------------------
+    pid_t pid_p1;
+    pid_t pid_p2;
+    pid_t pid_p3;
+    // ---------------------------------
+
     char dane[SHARED_SIZE];  //bufor na dane HEX
 } DaneWspolne;
 
@@ -102,6 +109,11 @@ int main(int argc, char *argv[]){
 
     printf("[MAIN] Procesy potomne utworzone: P1=%d, P2=%d, P3=%d\n", P1, P2, P3);
 
+    // Zapis PID-ów do pamięci współdzielonej, dzięki temu każdy proces będzie mógł odczytać PIDy rodzenstwa
+    dzielona_pamiec->pid_p1 = P1;
+    dzielona_pamiec->pid_p2 = P2;
+    dzielona_pamiec->pid_p3 = P3;
+
     #pragma endregion
 
     #pragma region ZAMYKANIE KONCOWEK w PIPE
@@ -128,6 +140,12 @@ int main(int argc, char *argv[]){
 
 //Czytanie z pliku/klawiatury/urandom -> Konwersja HEX -> Zapis do Shared Memory
 void proces_1() {
+    #pragma region POCZEKANIE NA UTWORZENIE P2 i P3
+    while(dzielona_pamiec->pid_p3 == 0) usleep(1000); //czekamy aż utworzą się wszystkie procesy
+
+    printf(" -> [P1] Widzę P2:%d, P3:%d\n", dzielona_pamiec->pid_p2, dzielona_pamiec->pid_p3);
+    #pragma endregion
+
     #pragma region ZMIENNE
     FILE *wejscie = NULL;
     size_t odczytane_bajty; //typ liczbowy bez znaku
@@ -216,7 +234,7 @@ void proces_1() {
     #pragma endregion
 
     if(tryb_pracy != 1 && wejscie != NULL) fclose(wejscie);
-    printf(" -> [P1] Zakończono pobieranie danych.\n");
+    printf("\n -> [P1] Zakończono pobieranie danych.\n");
 }
 
 //Odczyt z Shared Memory -> Zapis do PIPE
@@ -271,12 +289,35 @@ void proces_3() {
     printf(" -> [P3] Uruchomiony. Odczyt z Pipe i ekran.\n");
     
     char bufor_pipe[SHARED_SIZE];
-    ssize_t bajty;
+    ssize_t bajty; //signed size_t(system może zwracać -1 przez niektóre funkcje)
+    int licznik_jednostek = 0; //licznik elementow w wierszu(max 15)
+
+    printf("\n -> [P3] DANE WYJŚCIOWE:\n");
 
     // read() blokuje proces dopóki nie pojawią się dane w potoku. Zwraca EOF, gdy P2 zamnie swoją końcówkę do wpisywania potok[1]
     while ((bajty = read(potok[0], bufor_pipe, sizeof(bufor_pipe)-1)) > 0){
         bufor_pipe[bajty] = '\0'; //dodajemy znak EOF, bo read tego nie robi
-        printf("\n*** [P3] OTRZYMANO DANE HEX: ***\n%s\n********************************\n", bufor_pipe);
+
+        for(int i=0; i<bajty; i+=2){ //iterujemy co dwa, bo 1bajt = 2 znaki HEX
+            if (i+1 < bajty){ //sprawdzenie czy mamy parę znaków(zabezpieczenie przed uciętym bajtem)
+                printf("%c%c", bufor_pipe[i], bufor_pipe[i+1]);
+
+                licznik_jednostek++;
+
+                if (licznik_jednostek >= 15){
+                    printf("\n");
+                    licznik_jednostek = 0;
+                }
+                else{
+                    printf(" ");
+                }
+            }
+        }
+        fflush(stdout); //wymuszenie wypisania bufora ekranu, żeby tekst nie wisiał w pamięci terminala
+    }
+
+    if (licznik_jednostek != 0){ //gdyby linia nie była pełna
+        printf("\n");
     }
 
     close(potok[0]); //zamknięcie czytania

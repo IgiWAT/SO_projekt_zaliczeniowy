@@ -36,6 +36,10 @@ pid_t P1 = 0;
 pid_t P2 = 0;
 pid_t P3 = 0;
 
+// ------ ZMIENNE STERUJĄCE ------
+volatile int czy_dzialac = 1; // 1 - program działa, 0 = kończymy
+volatile int czy_wstrzymany = 0; // 0 = pracuje, 1 = pauza
+
 // ------ Zmienne dla procesów ------
 // Dla P1:
 int tryb_pracy = 0;
@@ -53,6 +57,7 @@ int potok[2];
 pid_t utworz_proces(void (*funkcja_procesu)(), const char* nazwa);
 int konfiguracja_trybow(int argc, char *argv[]);
 void to_hex(const char *ascii, size_t len, char *hex);
+void obsluga_sygnalow(int sygn);
 void proces_1();
 void proces_2();
 void proces_3();
@@ -140,26 +145,35 @@ int main(int argc, char *argv[]){
 
 //Czytanie z pliku/klawiatury/urandom -> Konwersja HEX -> Zapis do Shared Memory
 void proces_1() {
+    #pragma region Rejestracja sygnałów
+    signal(SIGTERM, obsluga_sygnalow); // S1
+    signal(SIGUSR1, obsluga_sygnalow); // S2
+    signal(SIGUSR2, obsluga_sygnalow); // S3
+    #pragma endregion
+
     #pragma region POCZEKANIE NA UTWORZENIE P2 i P3
-    while(dzielona_pamiec->pid_p3 == 0) usleep(1000); //czekamy aż utworzą się wszystkie procesy
+    // Czekamy, aż main zapisze PIDy, żebyśmy mogli wysyłać sygnały
+    while(dzielona_pamiec->pid_p3 == 0) usleep(1000); 
 
     printf(" -> [P1] Widzę P2:%d, P3:%d\n", dzielona_pamiec->pid_p2, dzielona_pamiec->pid_p3);
     #pragma endregion
 
     #pragma region ZMIENNE
     FILE *wejscie = NULL;
-    size_t odczytane_bajty; //typ liczbowy bez znaku
-    unsigned char bufor[1024];
-    int limit_urandom = 0; //Zabezpiecznie przy czytaniu urandom
-    char hex_bufor[(sizeof(bufor) * 2) + 1]; //każdy bajt to 2 znaki HEX + 1 bajt na znak konca napisu \0
+    size_t odczytane_bajty;
+    //unsigned char bufor[1024];
+    unsigned char bufor[20]; //na potrzeby testowania pliku i urandom
+    int limit_urandom = 0;
+    // Bufor HEX: 2 znaki na bajt + 1 na '\0'
+    char hex_bufor[(sizeof(bufor) * 2) + 1]; 
     #pragma endregion
 
     #pragma region WYBOR TRYBU PRACY
-    if(tryb_pracy==1){ //Klawiatura
+    if(tryb_pracy==1){ // Klawiatura
         wejscie = stdin;
-        printf(" -> [P1] Tryb Interaktywny. Wpisz tekst i zatwierdź ENTER(CTRL+D zakonczy)\n");    
+        printf(" -> [P1] Tryb Interaktywny. Wpisz tekst i zatwierdź ENTER (CTRL+D konczy)\n");    
     }
-    else if(tryb_pracy==2){ //Plik
+    else if(tryb_pracy==2){ // Plik
         wejscie = fopen(sciezka_do_pliku, "r");
         if(wejscie == NULL){
             perror(" -> [P1] Błąd otwarcia pliku wejściowego");
@@ -167,86 +181,106 @@ void proces_1() {
         }
         printf(" -> [P1] Otwarto plik: %s\n", sciezka_do_pliku);
     }
-    else if(tryb_pracy==3){
+    else if(tryb_pracy==3){ // Urandom
         wejscie = fopen("/dev/urandom", "r");
         if(wejscie == NULL){
-            perror(" -> [P1] Błąd otwierania/dev/urandom");
+            perror(" -> [P1] Błąd otwierania /dev/urandom");
             exit(1);
         }
-        printf(" -> [P1] Otwarto plik dev/urandom\n");   
+        printf(" -> [P1] Otwarto plik /dev/urandom\n");   
     }
     #pragma endregion
 
     printf(" -> [P1] Zaczynam czytać dane...\n");
 
-    // fread - wczytuje określoną ilość danych ze strumienia
-    while ((odczytane_bajty = fread(bufor, 1, sizeof(bufor), wejscie)) > 0){
-        #pragma region POBRANIE DANYCH -> ZAMIANA NA HEX
+    // Główna pętla przetwarzania
+    while (czy_dzialac && (odczytane_bajty = fread(bufor, 1, sizeof(bufor), wejscie)) > 0){
+        
+        // --- 1. OBSŁUGA PAUZY (Sygnał S2/S3) ---
+        while(czy_wstrzymany && czy_dzialac){ 
+            sleep(1); // Czekaj aktywnie na wznowienie
+        }
+        if(!czy_dzialac) break; // Jeśli w trakcie pauzy przyszedł SIGTERM, wychodzimy
+        // ---------------------------------------
+
+        #pragma region PRZETWARZANIE DANYCH
         printf(" -> [P1] Pobrano paczkę danych: %lu bajtów.\n", odczytane_bajty);
 
-        // !!! - należ uważać, że w odcztane_bajty wlicza się znak nowej linii (0x0A), dlatego należy to usunąć w funkcji
+        // Usuwanie znaku nowej linii (jeśli to nie dane binarne z urandom)
         if (tryb_pracy != 3 && odczytane_bajty > 0 && bufor[odczytane_bajty-1] == '\n'){
-            odczytane_bajty--; //bo znak nowej linii jest ostatnim bajtem
+            odczytane_bajty--;
         }
 
-        //jesli po usunieciu entera nic nie zostalo (np. wcisnieto sam ENTER) pomijamy pętlę
-        if(odczytane_bajty == 0){
-            continue;
-        }
+        // Jeśli po usunięciu entera bufor jest pusty, pomijamy
+        if(odczytane_bajty == 0) continue;
 
+        // Konwersja na HEX
         to_hex((char*)bufor, odczytane_bajty, hex_bufor);
-
         printf(" -> [P1] Wynik HEX: %s\n", hex_bufor);
         #pragma endregion
 
+        #pragma region ZAPIS DO SHARED MEMORY
+        // Czekamy, aż P2 odbierze poprzednie dane (status == 0)
+        // WAŻNE: Dodano warunek '&& czy_dzialac', żeby nie zawisnąć przy zamykaniu programu!
+        while(dzielona_pamiec->status == 1 && czy_dzialac){
+            usleep(1000); 
+        }
+        if(!czy_dzialac) break; // Wyjście awaryjne
+
+        // Kopiowanie i ustawienie flagi
+        strncpy(dzielona_pamiec->dane, hex_bufor, SHARED_SIZE-1);
+        dzielona_pamiec->dane[SHARED_SIZE-1]='\0';
+        dzielona_pamiec->status = 1;
+        #pragma endregion
+
+        sleep(1); //do testowania sygnałów dla pliku i urandom - później usunąć
+        
+        // Obsługa limitu dla urandom
         if(tryb_pracy==3){ 
             limit_urandom++;
-            if(limit_urandom >= 5){
+            if(limit_urandom >= 20){
                 printf(" -> [P1] Limit testowy urandom osiągnięty.\n");
                 break;
             }
             sleep(1);
         }
-
-        #pragma region ZAPIS do SHARED MEMORY
-
-        // Czekamy aż P2 odbierze dane (status=0)
-        while(dzielona_pamiec->status == 1){
-            usleep(1000); //1ms
-        }
-
-        // Kopiujemy dane do pamięci współdzielonej
-        strncpy(dzielona_pamiec->dane, hex_bufor, SHARED_SIZE-1); //kopiuje dane aż nie napotka znaku konca linii \0 strncpy(cel, zrodlo, max_znakow)
-        dzielona_pamiec->dane[SHARED_SIZE-1]='\0';
-
-        //informujemy P2, że dane są gotowe
-        dzielona_pamiec->status = 1;
-        #pragma endregion
     }
 
-    #pragma region KONIEC ZAPISYWANIA DO SHARED_MEMORY
-    //czekamy aż P2 odbierze ostanią daną
-    while(dzielona_pamiec->status == 1) usleep(1000);
+    #pragma region ZAKONCZENIE
+    // Czekamy aż P2 odbierze ostatnią paczkę (żeby nie nadpisać flagi końca)
+    while(dzielona_pamiec->status == 1 && czy_dzialac) usleep(1000);
 
-    dzielona_pamiec->czy_koniec=1; //flaga konca
-    dzielona_pamiec->status=1;
-
-    #pragma endregion
+    // Ustawiamy flagę końca tylko jeśli kończymy naturalnie (nie przez SIGTERM)
+    if(czy_dzialac) {
+        dzielona_pamiec->czy_koniec = 1;
+        dzielona_pamiec->status = 1;
+    }
 
     if(tryb_pracy != 1 && wejscie != NULL) fclose(wejscie);
     printf("\n -> [P1] Zakończono pobieranie danych.\n");
+    #pragma endregion
 }
 
 //Odczyt z Shared Memory -> Zapis do PIPE
 void proces_2() {
+    #pragma region Rejestracja sygnałów
+    signal(SIGTERM, obsluga_sygnalow); // S1
+    signal(SIGUSR1, obsluga_sygnalow); // S2
+    signal(SIGUSR2, obsluga_sygnalow); // S3
+    #pragma endregion
+
     close(potok[0]); //zamknięcie koncowki do czytania
 
     printf(" -> [P2] Uruchomiony. Czekam na dane w Shared Memory...\n");    
 
     #pragma region ODCZYT Z SHARED_MEMORY i zapis do PIPE
-    while(1){
+    while(czy_dzialac){
+        // Obsluga pauzy
+        while(czy_wstrzymany && czy_dzialac) sleep(1);
+        if (!czy_dzialac) break;
+
         // Czekamy na dane od P1 (status=1)
-        while(dzielona_pamiec->status == 0){
+        while(dzielona_pamiec->status == 0 && czy_dzialac){
             // Jeśli P1 jeszcze nic nie dał, sprawdzamy czy może już skończył? Ale P1 ustawia status=1 również przy wysyłaniu sygnału końca, więc główne sprawdzenie końca jest poniżej.
             usleep(1000);
         }
@@ -284,6 +318,12 @@ void proces_2() {
 
 //Odczyt z PIPE -> Wypisanie na ekran
 void proces_3() {
+    #pragma region Rejestracja sygnałów
+    signal(SIGTERM, obsluga_sygnalow); // S1
+    signal(SIGUSR1, obsluga_sygnalow); // S2
+    signal(SIGUSR2, obsluga_sygnalow); // S3
+    #pragma endregion
+
     close(potok[1]); //zamknięcie koncowki do pisania
 
     printf(" -> [P3] Uruchomiony. Odczyt z Pipe i ekran.\n");
@@ -295,13 +335,19 @@ void proces_3() {
     printf("\n -> [P3] DANE WYJŚCIOWE:\n");
 
     // read() blokuje proces dopóki nie pojawią się dane w potoku. Zwraca EOF, gdy P2 zamnie swoją końcówkę do wpisywania potok[1]
-    while ((bajty = read(potok[0], bufor_pipe, sizeof(bufor_pipe)-1)) > 0){
+    while (czy_dzialac && (bajty = read(potok[0], bufor_pipe, sizeof(bufor_pipe)-1)) > 0){
+        // OBSŁUGA PAUZY
+        // Uwaga: To zadziała dopiero po odebraniu danych, ale sygnał przerwie read() więc pętla się zakręci
+        while (czy_wstrzymany && czy_dzialac) sleep(1);
+        if (!czy_dzialac) break;
+
         bufor_pipe[bajty] = '\0'; //dodajemy znak EOF, bo read tego nie robi
+
+        printf("\n");
 
         for(int i=0; i<bajty; i+=2){ //iterujemy co dwa, bo 1bajt = 2 znaki HEX
             if (i+1 < bajty){ //sprawdzenie czy mamy parę znaków(zabezpieczenie przed uciętym bajtem)
                 printf("%c%c", bufor_pipe[i], bufor_pipe[i+1]);
-
                 licznik_jednostek++;
 
                 if (licznik_jednostek >= 15){
@@ -313,15 +359,57 @@ void proces_3() {
                 }
             }
         }
-        fflush(stdout); //wymuszenie wypisania bufora ekranu, żeby tekst nie wisiał w pamięci terminala
-    }
+        if (licznik_jednostek != 0){ //gdyby linia nie była pełna
+            printf("\n");
+            licznik_jednostek =0;
+        }
 
-    if (licznik_jednostek != 0){ //gdyby linia nie była pełna
-        printf("\n");
+        fflush(stdout); //wymuszenie wypisania bufora ekranu, żeby tekst nie wisiał w pamięci terminala
     }
 
     close(potok[0]); //zamknięcie czytania
     printf(" -> [P3] Koniec.\n");
+}
+
+// Funkcja obsługi sygnałów z propagacją
+void obsluga_sygnalow(int sygn){
+    pid_t my_pid = getpid();
+    pid_t p1 = dzielona_pamiec->pid_p1;
+    pid_t p2 = dzielona_pamiec->pid_p2;
+    pid_t p3 = dzielona_pamiec->pid_p3;
+
+    // 1. Obsługa SIGTERM (Koniec)
+    if (sygn == SIGTERM){ 
+        if(czy_dzialac == 1) { 
+            czy_dzialac = 0;
+            // Przekaz dalej
+            if (my_pid != p1) kill(p1, SIGTERM);
+            if (my_pid != p2) kill(p2, SIGTERM);
+            if (my_pid != p3) kill(p3, SIGTERM);
+
+            exit(0); //Natychmiastowe wyjście z procesu
+        }
+    }
+    // 2. Obsługa SIGUSR1 (Pauza)
+    else if (sygn == SIGUSR1) { 
+        if (czy_wstrzymany == 0) { 
+            czy_wstrzymany = 1;
+            // Przekaz dalej
+            if (my_pid != p1) kill(p1, SIGUSR1);
+            if (my_pid != p2) kill(p2, SIGUSR1);
+            if (my_pid != p3) kill(p3, SIGUSR1);
+        }
+    } 
+    // 3. Obsługa SIGUSR2 (Wznowienie)
+    else if (sygn == SIGUSR2) { 
+        if (czy_wstrzymany == 1) { 
+            czy_wstrzymany = 0;
+            // Przekaz dalej
+            if (my_pid != p1) kill(p1, SIGUSR2);
+            if (my_pid != p2) kill(p2, SIGUSR2);
+            if (my_pid != p3) kill(p3, SIGUSR2);
+        }
+    }
 }
 
 pid_t utworz_proces(void (*funkcja_procesu)(), const char* nazwa){

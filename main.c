@@ -23,6 +23,7 @@ typedef struct{
     pid_t pid_p3;
     // ---------------------------------
 
+    int wielkosc_danych;
     char dane[SHARED_SIZE];  //bufor na dane HEX
 } DaneWspolne;
 
@@ -39,6 +40,7 @@ pid_t P3 = 0;
 // ------ ZMIENNE STERUJĄCE ------
 volatile int czy_dzialac = 1; // 1 - program działa, 0 = kończymy
 volatile int czy_wstrzymany = 0; // 0 = pracuje, 1 = pauza
+volatile int tryb_hex = 1; // 1 = konwersja na hex włączona, 0 = wyłączona
 
 // ------ Zmienne dla procesów ------
 // Dla P1:
@@ -114,6 +116,24 @@ int main(int argc, char *argv[]){
 
     printf("[MAIN] Procesy potomne utworzone: P1=%d, P2=%d, P3=%d\n", P1, P2, P3);
 
+    // ... istniejący kod tworzenia procesów ...
+    P3 = utworz_proces(proces_3, "P3");
+
+    printf("[MAIN] Procesy potomne utworzone: P1=%d, P2=%d, P3=%d\n", P1, P2, P3);
+    
+    // --- Zapis PIDów do pliku dla Managera ---
+    FILE *plik_pid = fopen("pidy_procesow.txt", "w");
+    if (plik_pid) {
+        fprintf(plik_pid, "%d %d %d", P1, P2, P3);
+        fclose(plik_pid);
+        printf("[MAIN] Zapisano PID-y do pliku 'pidy_procesow.txt'.\n");
+    } else {
+        perror("[MAIN] Nie udało się zapisać pliku z PIDami");
+    }
+    // --------------------------------------------------------
+
+    // Zapis PID-ów do pamięci współdzielonej... (reszta Twojego kodu)
+
     // Zapis PID-ów do pamięci współdzielonej, dzięki temu każdy proces będzie mógł odczytać PIDy rodzenstwa
     dzielona_pamiec->pid_p1 = P1;
     dzielona_pamiec->pid_p2 = P2;
@@ -133,6 +153,8 @@ int main(int argc, char *argv[]){
 
     printf("[MAIN] Wszystkie procesy zakończone. Koniec.\n");
 
+    unlink("pidy_procesow.txt"); // Usuwamy plik pomocniczy 
+
     //Sprzatanie po shared_memory
     shmdt(dzielona_pamiec);         // Odlaczenie pamieci od P0
     shmctl(shm_id, IPC_RMID, NULL); // Oznaczamy do usuniecia z systemu
@@ -149,6 +171,7 @@ void proces_1() {
     signal(SIGTERM, obsluga_sygnalow); // S1
     signal(SIGUSR1, obsluga_sygnalow); // S2
     signal(SIGUSR2, obsluga_sygnalow); // S3
+    signal(SIGALRM, obsluga_sygnalow); // S4
     #pragma endregion
 
     #pragma region POCZEKANIE NA UTWORZENIE P2 i P3
@@ -215,9 +238,18 @@ void proces_1() {
         // Jeśli po usunięciu entera bufor jest pusty, pomijamy
         if(odczytane_bajty == 0) continue;
 
-        // Konwersja na HEX
-        to_hex((char*)bufor, odczytane_bajty, hex_bufor);
-        printf(" -> [P1] Wynik HEX: %s\n", hex_bufor);
+        // Konwersja na HEX / ASCII
+        if (tryb_hex == 1){
+            // Konwersja na HEX
+            to_hex((char*)bufor, odczytane_bajty, hex_bufor);
+            printf(" -> [P1] Wynik HEX: %s\n", hex_bufor);
+        }
+        else{
+            // Kopiujemy surowe dane. Upewniamy się,, że nie przekroczymy bufora wyjściowego
+            memcpy(hex_bufor, bufor, odczytane_bajty); //Kopiuje zawartość jednego bloku pamięci do drugiego (dest, source, num)
+            hex_bufor[odczytane_bajty] = '\0';
+            printf(" -> [P1] Wynik RAW: %s\n", hex_bufor);
+        }
         #pragma endregion
 
         #pragma region ZAPIS DO SHARED MEMORY
@@ -231,6 +263,15 @@ void proces_1() {
         // Kopiowanie i ustawienie flagi
         strncpy(dzielona_pamiec->dane, hex_bufor, SHARED_SIZE-1);
         dzielona_pamiec->dane[SHARED_SIZE-1]='\0';
+
+        //Zapisanie ile bajtow wysyłamy
+        if(tryb_hex == 1){
+            dzielona_pamiec->wielkosc_danych = strlen(hex_bufor);
+        }
+        else{
+            dzielona_pamiec->wielkosc_danych = odczytane_bajty;
+        }
+
         dzielona_pamiec->status = 1;
         #pragma endregion
 
@@ -268,6 +309,7 @@ void proces_2() {
     signal(SIGTERM, obsluga_sygnalow); // S1
     signal(SIGUSR1, obsluga_sygnalow); // S2
     signal(SIGUSR2, obsluga_sygnalow); // S3
+    signal(SIGALRM, obsluga_sygnalow); // S4
     #pragma endregion
 
     close(potok[0]); //zamknięcie koncowki do czytania
@@ -294,7 +336,7 @@ void proces_2() {
         //printf(" -> [P2] POBRANO z SHM: %s\n", dzielona_pamiec->dane);
 
         #pragma region ZAPIS DO PIPE
-        int len = strlen(dzielona_pamiec->dane);
+        int len = dzielona_pamiec->wielkosc_danych;
         if (len>0){
             // write(deskryptor, bufor, ilosc_bajtow)
             if (write(potok[1], dzielona_pamiec->dane, len) == -1){
@@ -323,6 +365,7 @@ void proces_3() {
     signal(SIGTERM, obsluga_sygnalow); // S1
     signal(SIGUSR1, obsluga_sygnalow); // S2
     signal(SIGUSR2, obsluga_sygnalow); // S3
+    signal(SIGALRM, obsluga_sygnalow); // S4
     #pragma endregion
 
     close(potok[1]); //zamknięcie koncowki do pisania
@@ -344,22 +387,29 @@ void proces_3() {
 
         bufor_pipe[bajty] = '\0'; //dodajemy znak EOF, bo read tego nie robi
 
-        printf("\n");
+        if (tryb_hex == 1){
+            printf("\n");
 
-        for(int i=0; i<bajty; i+=2){ //iterujemy co dwa, bo 1bajt = 2 znaki HEX
-            if (i+1 < bajty){ //sprawdzenie czy mamy parę znaków(zabezpieczenie przed uciętym bajtem)
-                printf("%c%c", bufor_pipe[i], bufor_pipe[i+1]);
-                licznik_jednostek++;
+            for(int i=0; i<bajty; i+=2){ //iterujemy co dwa, bo 1bajt = 2 znaki HEX
+                if (i+1 < bajty){ //sprawdzenie czy mamy parę znaków(zabezpieczenie przed uciętym bajtem)
+                    printf("%c%c", bufor_pipe[i], bufor_pipe[i+1]);
+                    licznik_jednostek++;
 
-                if (licznik_jednostek >= 15){
-                    printf("\n");
-                    licznik_jednostek = 0;
-                }
-                else{
-                    printf(" ");
+                    if (licznik_jednostek >= 15){
+                        printf("\n");
+                        licznik_jednostek = 0;
+                    }
+                    else{
+                        printf(" ");
+                    }
                 }
             }
         }
+        else{ //tryb RAW
+            printf("%s", bufor_pipe);
+            licznik_jednostek = 0;
+        }
+        
         if (licznik_jednostek != 0){ //gdyby linia nie była pełna
             printf("\n");
             licznik_jednostek =0;
@@ -410,6 +460,15 @@ void obsluga_sygnalow(int sygn){
             if (my_pid != p2) kill(p2, SIGUSR2);
             if (my_pid != p3) kill(p3, SIGUSR2);
         }
+    }
+    // 4. Obsługa SIGALRM (Przełączanie konwersji HEX/ASCII)
+    else if (sygn == SIGALRM){
+        tryb_hex = !tryb_hex;
+
+        // Propagacja do innych procesów (żeby P1 wiedział co wysłać, a P3 jak odebrać)
+        if (my_pid != p1) kill(p1, SIGALRM);
+        if (my_pid != p2) kill(p2, SIGALRM);
+        if (my_pid != p3) kill(p3, SIGALRM);
     }
 }
 

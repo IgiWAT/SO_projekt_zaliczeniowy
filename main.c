@@ -1,3 +1,6 @@
+#define _POSIX_C_SOURCE 200809L // Wymagane dla sigaction i struct siginfo_t
+#define _DEFAULT_SOURCE         // Przywraca widoczność usleep
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -7,6 +10,7 @@
 #include <string.h>
 #include <sys/ipc.h> 
 #include <sys/shm.h> 
+#include <errno.h> // Biblioteka do obsługi błędów (EINTR)
 
 #pragma region ZMIENNE GLOBALNE dla SHARED_MEMORY
 
@@ -50,7 +54,10 @@ int potok[2];
 pid_t utworz_proces(void (*funkcja_procesu)(), const char* nazwa);
 int konfiguracja_trybow(int argc, char *argv[]);
 void to_hex(const char *ascii, size_t len, char *hex);
-void obsluga_sygnalow(int sygn);
+
+void obsluga_sygnalow_extended(int sygn, siginfo_t *info, void *context);
+void zarejestruj_sygnaly();
+
 void proces_1();
 void proces_2();
 void proces_3();
@@ -61,9 +68,6 @@ int main(int argc, char *argv[]){
     if (konfiguracja_trybow(argc, argv) != 0){
         return 1;
     }
-
-    // P0 - proces macierzysty
-    // printf("P0 - PID: %d\n", getpid()); 
 
     #pragma region TWORZENIE PAMIECI WSPOLDZIELONEJ
     shm_id = shmget(IPC_PRIVATE, sizeof(DaneWspolne), 0666 | IPC_CREAT);
@@ -134,12 +138,22 @@ int main(int argc, char *argv[]){
     return 0;
 }
 
+// Funkcja pomocnicza do rejestracji sygnałów przez sigaction
+void zarejestruj_sygnaly() {
+    struct sigaction sa;
+    sa.sa_sigaction = obsluga_sygnalow_extended;
+    sa.sa_flags = SA_SIGINFO; // Kluczowe: pozwala pobrać PID nadawcy
+    sigemptyset(&sa.sa_mask);
+
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGUSR1, &sa, NULL);
+    sigaction(SIGUSR2, &sa, NULL);
+    sigaction(SIGALRM, &sa, NULL);
+}
+
 // P1: Czytanie -> Konwersja -> Shared Memory
 void proces_1() {
-    signal(SIGTERM, obsluga_sygnalow);
-    signal(SIGUSR1, obsluga_sygnalow); 
-    signal(SIGUSR2, obsluga_sygnalow); 
-    signal(SIGALRM, obsluga_sygnalow); 
+    zarejestruj_sygnaly(); 
 
     // Czekamy na inicjalizację PIDów w pamięci
     while(dzielona_pamiec->pid_p3 == 0) usleep(1000); 
@@ -147,10 +161,6 @@ void proces_1() {
     FILE *wejscie = NULL;
     ssize_t odczytane_bajty;
     
-    // --- BUFOR PRODUKCYJNY ---
-    // Zwiększamy bufor wejściowy. Musi być mniejszy niż (SHARED_SIZE / 2),
-    // ponieważ w trybie HEX 1 bajt wejścia = 2 bajty wyjścia.
-    // SHARED_SIZE = 4096, więc bezpiecznie max ~2000. Dajemy 1024.
     unsigned char bufor[1024]; 
     char hex_bufor[(sizeof(bufor) * 2) + 1]; 
 
@@ -175,20 +185,27 @@ void proces_1() {
     }
 
     // Pętla główna
-    while (czy_dzialac && (odczytane_bajty = read(fileno(wejscie), bufor, sizeof(bufor))) > 0){
+    while (czy_dzialac){
+        // Obsługa EINTR dla read()
+        odczytane_bajty = read(fileno(wejscie), bufor, sizeof(bufor));
         
+        if (odczytane_bajty < 0) {
+            if (errno == EINTR) continue; // Sygnał przerwał, próbujemy ponownie
+            else break; // Prawdziwy błąd, koniec
+        }
+        if (odczytane_bajty == 0) break; // EOF (Koniec pliku)
+
         // Obsługa pauzy
         while(czy_wstrzymany && czy_dzialac) { 
-            usleep(100000); // 100ms sleep w pauzie, żeby nie obciążać CPU
+            usleep(100000); 
         }
         if(!czy_dzialac) break; 
 
-        // Usuwanie nowej linii tylko w trybie interaktywnym/plikowym (nie binarnym)
-        if (tryb_pracy != 3 && odczytane_bajty > 0 && bufor[odczytane_bajty-1] == '\n'){
-            odczytane_bajty--;
-        }
-        if(odczytane_bajty == 0) continue;
-
+        // ZMIANA: Usunięto sztuczne usuwanie '\n' w trybie HEX.
+        // Dzięki temu ENTER (0x0A) jest przesyłany jako dane, co daje reakcję programu
+        // nawet przy wciśnięciu samego entera i zapobiega błędom "nic się nie dzieje".
+        // W trybie interaktywnym pozwala to na lepsze oddzielenie wizualne.
+        
         // Konwersja
         if (tryb_hex == 1){
             to_hex((char*)bufor, odczytane_bajty, hex_bufor);
@@ -199,9 +216,8 @@ void proces_1() {
         }
 
         // Synchronizacja i zapis
-        // Czekamy aż P2 zwolni pamięć (status == 0)
         while(dzielona_pamiec->status == 1 && czy_dzialac){
-            usleep(100); // Krótkie czekanie (Active Wait z usypianiem)
+            usleep(100); 
         }
         if(!czy_dzialac) break; 
 
@@ -214,8 +230,6 @@ void proces_1() {
 
         // Ustawienie flagi dla P2
         dzielona_pamiec->status = 1;
-        
-        // Brak sleep(1) - maksymalna prędkość!
     }
 
     // Wyjście z programu
@@ -232,10 +246,7 @@ void proces_1() {
 
 // P2: Shared Memory -> Pipe
 void proces_2() {
-    signal(SIGTERM, obsluga_sygnalow); 
-    signal(SIGUSR1, obsluga_sygnalow);
-    signal(SIGUSR2, obsluga_sygnalow);
-    signal(SIGALRM, obsluga_sygnalow);
+    zarejestruj_sygnaly(); 
 
     close(potok[0]); 
 
@@ -253,9 +264,18 @@ void proces_2() {
         // Przekazanie do potoku
         int len = dzielona_pamiec->wielkosc_danych;
         if (len > 0){
-            if (write(potok[1], dzielona_pamiec->dane, len) == -1){
-                perror(" -> [P2] Błąd zapisu do potoku");
-                break;
+            ssize_t written_total = 0;
+            while (written_total < len) {
+                ssize_t ret = write(potok[1], dzielona_pamiec->dane + written_total, len - written_total);
+                if (ret == -1) {
+                    if (errno == EINTR) continue; // Przerwano, ponawiamy
+                    else {
+                        perror(" -> [P2] Błąd zapisu do potoku");
+                        czy_dzialac = 0; 
+                        break;
+                    }
+                }
+                written_total += ret;
             }
         }
 
@@ -269,10 +289,7 @@ void proces_2() {
 
 // P3: Pipe -> Ekran
 void proces_3() {
-    signal(SIGTERM, obsluga_sygnalow);
-    signal(SIGUSR1, obsluga_sygnalow);
-    signal(SIGUSR2, obsluga_sygnalow);
-    signal(SIGALRM, obsluga_sygnalow);
+    zarejestruj_sygnaly(); 
 
     close(potok[1]);
     
@@ -280,10 +297,16 @@ void proces_3() {
     ssize_t bajty; 
     int licznik_jednostek = 0; 
 
-    // printf("\n -> [P3] DANE WYJŚCIOWE:\n"); // Opcjonalne
+    while (czy_dzialac){
+        // Obsługa EINTR dla read z potoku
+        bajty = read(potok[0], bufor_pipe, sizeof(bufor_pipe)-1);
 
-    while (czy_dzialac && (bajty = read(potok[0], bufor_pipe, sizeof(bufor_pipe)-1)) > 0){
-        
+        if (bajty < 0) {
+            if (errno == EINTR) continue; 
+            else break; // Błąd potoku
+        }
+        if (bajty == 0) break; // EOF
+
         while (czy_wstrzymany && czy_dzialac) usleep(100000);
         if (!czy_dzialac) break;
 
@@ -301,59 +324,62 @@ void proces_3() {
                     }
                 }
             }
+            fflush(stdout); 
+
+            // ZMIANA: Wizualne czyszczenie w trybie interaktywnym.
+            // Jeśli tryb to -i, wymuszamy nową linię po każdym przetworzonym bloku danych,
+            // aby kolejne wpisywanie tekstu przez użytkownika zaczynało się w nowym wierszu.
+            if (tryb_pracy == 1 && licznik_jednostek != 0) {
+                printf("\n");
+                licznik_jednostek = 0;
+            }
         }
         else{ 
-            printf("%s", bufor_pipe);
-            fflush(stdout); // Ważne przy raw
+            // Wypisywanie RAW
+            fwrite(bufor_pipe, 1, bajty, stdout);
+            fflush(stdout); 
             licznik_jednostek = 0;
         }
-        
-        // fflush(stdout); // Zbyt częste flushowanie zwalnia, ale zapewnia płynność
     }
     
-    // Dopisz enter na końcu, jeśli linia nie była pełna
     if (licznik_jednostek != 0) printf("\n");
-
     close(potok[0]); 
     exit(0);
 }
 
 // Obsługa sygnałów
-void obsluga_sygnalow(int sygn){
+void obsluga_sygnalow_extended(int sygn, siginfo_t *info, void *context){
+    pid_t nadawca = info->si_pid;
     pid_t my_pid = getpid();
     pid_t p1 = dzielona_pamiec->pid_p1;
     pid_t p2 = dzielona_pamiec->pid_p2;
     pid_t p3 = dzielona_pamiec->pid_p3;
 
+    int czy_od_programu = (nadawca == p1 || nadawca == p2 || nadawca == p3);
+
     if (sygn == SIGTERM){ 
-        if(czy_dzialac == 1) { 
-            czy_dzialac = 0;
-            if (my_pid != p1) kill(p1, SIGTERM);
-            if (my_pid != p2) kill(p2, SIGTERM);
-            if (my_pid != p3) kill(p3, SIGTERM);
-        }
+        if(czy_dzialac == 1) czy_dzialac = 0;
     }
     else if (sygn == SIGUSR1) { 
-        if (czy_wstrzymany == 0) { 
-            czy_wstrzymany = 1;
-            if (my_pid != p1) kill(p1, SIGUSR1);
-            if (my_pid != p2) kill(p2, SIGUSR1);
-            if (my_pid != p3) kill(p3, SIGUSR1);
-        }
+        if (czy_wstrzymany == 0) czy_wstrzymany = 1;
     } 
     else if (sygn == SIGUSR2) { 
-        if (czy_wstrzymany == 1) { 
-            czy_wstrzymany = 0;
-            if (my_pid != p1) kill(p1, SIGUSR2);
-            if (my_pid != p2) kill(p2, SIGUSR2);
-            if (my_pid != p3) kill(p3, SIGUSR2);
-        }
+        if (czy_wstrzymany == 1) czy_wstrzymany = 0;
     }
     else if (sygn == SIGALRM){
         tryb_hex = !tryb_hex;
-        if (my_pid != p1) kill(p1, SIGALRM);
-        if (my_pid != p2) kill(p2, SIGALRM);
-        if (my_pid != p3) kill(p3, SIGALRM);
+    }
+
+    if (!czy_od_programu) {
+        if (sygn == SIGTERM) {
+            if (my_pid != p1) kill(p1, SIGTERM);
+            if (my_pid != p2) kill(p2, SIGTERM);
+            if (my_pid != p3) kill(p3, SIGTERM);
+        } else {
+            if (my_pid != p1) kill(p1, sygn);
+            if (my_pid != p2) kill(p2, sygn);
+            if (my_pid != p3) kill(p3, sygn);
+        }
     }
 }
 

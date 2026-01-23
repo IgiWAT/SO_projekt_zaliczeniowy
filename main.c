@@ -200,11 +200,6 @@ void proces_1() {
             usleep(100000); 
         }
         if(!czy_dzialac) break; 
-
-        // ZMIANA: Usunięto sztuczne usuwanie '\n' w trybie HEX.
-        // Dzięki temu ENTER (0x0A) jest przesyłany jako dane, co daje reakcję programu
-        // nawet przy wciśnięciu samego entera i zapobiega błędom "nic się nie dzieje".
-        // W trybie interaktywnym pozwala to na lepsze oddzielenie wizualne.
         
         // Konwersja
         if (tryb_hex == 1){
@@ -325,10 +320,7 @@ void proces_3() {
                 }
             }
             fflush(stdout); 
-
-            // ZMIANA: Wizualne czyszczenie w trybie interaktywnym.
-            // Jeśli tryb to -i, wymuszamy nową linię po każdym przetworzonym bloku danych,
-            // aby kolejne wpisywanie tekstu przez użytkownika zaczynało się w nowym wierszu.
+            
             if (tryb_pracy == 1 && licznik_jednostek != 0) {
                 printf("\n");
                 licznik_jednostek = 0;

@@ -1,0 +1,2 @@
+usunąć ENTER w -i -2
++ dodać semafory -3
